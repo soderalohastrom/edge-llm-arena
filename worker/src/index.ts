@@ -5,6 +5,8 @@
  *
  * POST / or /chat — chat completion (streaming SSE or JSON)
  *   Body: { system?, prompt?, messages?, model?, stream? }
+ * POST /runoff — parallel multi-model inference (non-streaming)
+ *   Body: { system?, prompt, models?: string[] }
  * GET /health — status + available models
  */
 
@@ -119,8 +121,78 @@ export default {
       }
     }
 
+    // Runoff endpoint — parallel non-streaming inference across multiple models
+    if (request.method === 'POST' && url.pathname === '/runoff') {
+      try {
+        const body = (await request.json()) as {
+          system?: string;
+          prompt: string;
+          models?: string[];
+        };
+
+        if (!body.prompt) {
+          return Response.json({ error: 'prompt is required' }, { status: 400, headers: CORS });
+        }
+
+        const modelKeys = body.models?.length
+          ? body.models.filter((k) => MODELS[k])
+          : Object.keys(MODELS);
+
+        if (modelKeys.length === 0) {
+          return Response.json(
+            { error: 'No valid models specified', available: Object.keys(MODELS) },
+            { status: 400, headers: CORS }
+          );
+        }
+
+        const messages: { role: string; content: string }[] = [];
+        if (body.system) messages.push({ role: 'system', content: body.system });
+        messages.push({ role: 'user', content: body.prompt });
+
+        const settled = await Promise.allSettled(
+          modelKeys.map(async (key) => {
+            const model = MODELS[key];
+            const start = Date.now();
+            const result = await env.AI.run(model.id as BaseAiTextGenerationModels, {
+              messages,
+              max_tokens: 2048,
+            });
+            return {
+              model: key,
+              label: model.label,
+              tier: model.tier,
+              params: model.params,
+              response: (result as { response: string }).response,
+              latency_ms: Date.now() - start,
+            };
+          })
+        );
+
+        const results = settled.map((s, i) =>
+          s.status === 'fulfilled'
+            ? s.value
+            : {
+                model: modelKeys[i],
+                label: MODELS[modelKeys[i]].label,
+                tier: MODELS[modelKeys[i]].tier,
+                params: MODELS[modelKeys[i]].params,
+                response: null,
+                latency_ms: null,
+                error: s.reason?.message || 'Unknown error',
+              }
+        );
+
+        return Response.json({ results }, { headers: CORS });
+      } catch (err) {
+        return Response.json(
+          { error: err instanceof Error ? err.message : 'Unknown error' },
+          { status: 500, headers: CORS }
+        );
+      }
+    }
+
     return Response.json(
-      { error: 'Not found', endpoints: ['POST / or /chat', 'GET /health', 'GET /models'] },
+      { error: 'Not found', endpoints: ['POST / or /chat', 'POST /runoff', 'GET /health', 'GET /models'] },
       { status: 404, headers: CORS }
     );
   },
